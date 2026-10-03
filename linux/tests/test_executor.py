@@ -139,3 +139,42 @@ def test_file_paths_must_be_absolute(ex, monkeypatch):
 def test_device_health_reports_basics(ex):
     payload = ex.run("device.health", {})["payload"]
     assert payload["version"] and payload["hostname"] and "disk_gb" in payload
+
+
+def _fake_docker(monkeypatch, stdout="", returncode=0, stderr=""):
+    import subprocess
+
+    class Proc:
+        def __init__(self):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return Proc()
+
+    monkeypatch.setattr(executor.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    return calls
+
+
+def test_homelab_docker_ps_lists_containers(ex, monkeypatch):
+    calls = _fake_docker(monkeypatch, stdout="miner\ttdm:latest\tUp 3 hours")
+    result = ex.run("homelab.docker", {})
+    assert result["ok"] is True
+    assert "miner" in result["payload"]["output"]
+    assert calls[0][:2] == ["docker", "ps"]
+
+
+def test_homelab_docker_restart_needs_a_name(ex, monkeypatch):
+    _fake_docker(monkeypatch)
+    assert ex.run("homelab.docker", {"action": "restart"})["ok"] is False
+    assert ex.run("homelab.docker", {"action": "restart", "container": "a;b"})["ok"] is False
+
+
+def test_homelab_docker_errors_without_docker(ex, monkeypatch):
+    monkeypatch.setattr(executor.shutil, "which", lambda name: None)
+    assert ex.run("homelab.docker", {}) == {"ok": False, "error": "docker is not installed"}

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import pwd
+import re
 import shutil
 import signal
 import socket
@@ -34,6 +35,7 @@ import time
 from dataclasses import dataclass
 
 from musegadget import __version__
+from musegadget import media
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +97,55 @@ COMMAND_SPECS = {
         "required": {},
         "optional": {},
     },
+    "homelab.docker": {
+        "description": (
+            "Docker on this machine. action 'ps' (default) lists containers as "
+            "name, image and status; action 'restart' restarts one container "
+            "by name. Needs the run-as account in the docker group, no sudo."
+        ),
+        "required": {},
+        "optional": {
+            "action": {"type": "string", "description": "'ps' (default) or 'restart'."},
+            "container": {"type": "string", "description": "Container name, for action 'restart'."},
+        },
+    },
+    "media.search": {
+        "description": (
+            "Search the *arr indexers for a series or movie by title. "
+            "Returns candidates with tvdbId/tmdbId for media.add."
+        ),
+        "required": {
+            "query": {"type": "string", "description": "Title to search for."},
+        },
+        "optional": {
+            "type": {"type": "string", "description": "'series' (default) or 'movie'."},
+        },
+    },
+    "media.add": {
+        "description": (
+            "Add a series to Sonarr or a movie to Radarr by id from "
+            "media.search. Monitors it and starts a search."
+        ),
+        "required": {
+            "id": {"type": "integer", "description": "tvdbId (series) or tmdbId (movie)."},
+            "title": {"type": "string", "description": "Title, used to match the lookup result."},
+        },
+        "optional": {
+            "type": {"type": "string", "description": "'series' (default) or 'movie'."},
+        },
+    },
+    "media.queue": {
+        "description": "Merged Sonarr/Radarr download queue: title, status, percent, time left.",
+        "required": {},
+        "optional": {},
+    },
+    "media.recent": {
+        "description": "Recently added movies and episodes on Jellyfin.",
+        "required": {},
+        "optional": {
+            "limit": {"type": "integer", "description": "Max items, default 10."},
+        },
+    },
 }
 
 
@@ -136,6 +187,10 @@ class Executor:
                 return self.file_op(command.split(".")[1], params)
             if command == "device.health":
                 return ok(device_health())
+            if command == "homelab.docker":
+                return self.homelab_docker(params)
+            if command.startswith("media."):
+                return self._media(command[len("media."):], params)
         except Exception as exc:
             log.exception("%s failed", command)
             return error(f"{type(exc).__name__}: {exc}")
@@ -203,6 +258,38 @@ class Executor:
             "truncated": out_cut or err_cut,
             "duration_ms": int((time.monotonic() - started) * 1000),
         })
+
+    def homelab_docker(self, params: dict) -> dict:
+        if shutil.which("docker") is None:
+            return error("docker is not installed")
+        action = params.get("action") or "ps"
+        if action == "ps":
+            argv = ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"]
+            timeout = 30
+        elif action == "restart":
+            name = params.get("container")
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name or ""):
+                return error("container is required for action 'restart'")
+            argv = ["docker", "restart", name]
+            timeout = 120
+        else:
+            return error(f"unsupported action: {action}")
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout,
+                **self._child_options(),
+            )
+        except subprocess.TimeoutExpired:
+            return error(f"docker {action} timed out")
+        if proc.returncode != 0:
+            return error(proc.stderr.strip() or f"docker {action} exited {proc.returncode}")
+        return ok({"output": proc.stdout.strip()})
+
+    def _media(self, action: str, params: dict) -> dict:
+        try:
+            return ok(media.run(action, params))
+        except media.MediaError as exc:
+            return error(str(exc))
 
     def file_op(self, op: str, params: dict) -> dict:
         request = json.dumps({**params, "op": op})
